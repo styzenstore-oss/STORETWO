@@ -1,0 +1,32 @@
+import { NextResponse } from 'next/server'
+import { db, err, authUser } from '@/lib/server'
+import { createQris } from '@/lib/stenly'
+export async function POST(req: Request) {
+  const u = await authUser(req); if (!u) return err('Silakan login dulu', 401)
+  const { items, name, wa, method, voucher } = await req.json()
+  if (!name?.trim() || !items?.length) return err('Nama dan keranjang wajib diisi')
+  const { data: ps } = await db.from('product_stock').select('*').in('id', items.map((i: any) => i.product_id))
+  let total = 0; const lines: any[] = []
+  for (const i of items) {
+    const p = ps?.find((x: any) => x.id === i.product_id); const q = Math.max(1, parseInt(i.qty) || 1)
+    if (!p) return err('Produk tidak ditemukan'); if (p.stock < q) return err(`Stok ${p.name} tidak cukup`)
+    const price = Math.round(p.price * (100 - (p.discount || 0)) / 100); total += price * q
+    lines.push({ product_id: p.id, name: p.name, qty: q, price })
+  }
+  let vcode = null
+  if (voucher?.trim()) {
+    const { data: v } = await db.from('vouchers').select('*').eq('code', voucher.trim().toUpperCase()).maybeSingle()
+    if (!v) return err('Voucher tidak valid'); total = Math.max(1000, total - v.amount); vcode = v.code
+  }
+  const { data: o } = await db.from('orders').insert({ user_id: u.id, buyer_name: name, wa: wa || null, items: lines, total, voucher: vcode, method }).select().single()
+  if (method === 'saldo') {
+    const { data: ok } = await db.rpc('change_balance', { uid: u.id, amt: -total })
+    if (!ok) { await db.from('orders').delete().eq('id', o.id); return err('Saldo tidak cukup') }
+    await db.rpc('fulfill_order', { oid: o.id }); return NextResponse.json({ id: o.id })
+  }
+  try {
+    const q = await createQris(o.id, total, name, wa)
+    await db.from('orders').update({ gateway_ref: q.ref, qris: q.qr }).eq('id', o.id)
+    return NextResponse.json({ id: o.id })
+  } catch (e: any) { await db.from('orders').delete().eq('id', o.id); return err(e.message, 502) }
+}
